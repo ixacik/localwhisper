@@ -6,6 +6,9 @@
 //
 
 import SwiftUI
+import SwiftData
+import AppKit
+import os
 
 @main
 struct LocalASRApp: App {
@@ -16,21 +19,36 @@ struct LocalASRApp: App {
     @State private var textInjector = TextInjector()
     @State private var overlayController: OverlayWindowController?
 
+    let modelContainer: ModelContainer
+
+    init() {
+        do {
+            modelContainer = try ModelContainer(for: DictationSession.self)
+        } catch {
+            fatalError("Failed to initialize ModelContainer: \(error)")
+        }
+    }
+
     var body: some Scene {
         MenuBarExtra {
-            MenuBarView(appState: appState)
+            // Pass modelContext explicitly - MenuBarExtra doesn't properly propagate environment
+            MenuBarView(
+                appState: appState,
+                transcriptionEngine: $transcriptionEngine,
+                modelContext: modelContainer.mainContext
+            )
         } label: {
             Label("LocalASR", systemImage: appState.isListening ? "waveform.circle.fill" : "waveform")
         }
         .menuBarExtraStyle(.menu)
 
         Settings {
-            PreferencesView(appState: appState)
+            PreferencesView(
+                appState: appState,
+                transcriptionEngine: $transcriptionEngine
+            )
         }
-    }
-
-    init() {
-        // Initialization happens in onAppear of MenuBarView
+        .modelContainer(modelContainer)
     }
 }
 
@@ -38,9 +56,11 @@ struct LocalASRApp: App {
 
 struct MenuBarView: View {
     @Bindable var appState: AppState
+    @Binding var transcriptionEngine: TranscriptionEngine?
+    let modelContext: ModelContext
+    @Environment(\.openSettings) private var openSettings
     @State private var hotkeyManager: HotkeyManager?
     @State private var audioManager: AudioCaptureManager?
-    @State private var transcriptionEngine: TranscriptionEngine?
     @State private var textInjector = TextInjector()
     @State private var overlayController: OverlayWindowController?
     @State private var hasInitialized = false
@@ -74,7 +94,7 @@ struct MenuBarView: View {
 
                     Button {
                         AccessibilityHelper.requestPermission()
-                        checkAccessibilityPermission()
+                        AccessibilityHelper.openAccessibilityPreferences()
                     } label: {
                         HStack {
                             Image(systemName: appState.hasAccessibilityPermission ? "checkmark.circle.fill" : "circle")
@@ -90,14 +110,16 @@ struct MenuBarView: View {
             // Model section
             if !appState.isModelLoaded {
                 Section {
-                    if case .downloading(let progress) = appState.dictationState {
-                        HStack {
-                            ProgressView(value: progress)
-                            Text("\(Int(progress * 100))%")
+                    if appState.isLoadingModel {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(appState.isModelCached ? "Loading model..." : "Downloading model...")
+                                .foregroundStyle(.secondary)
                         }
                     } else {
-                        Button("Download Model (~1.5 GB)") {
-                            Task { await downloadModel() }
+                        Button(appState.modelActionText) {
+                            Task { await loadModel() }
                         }
                     }
                 }
@@ -106,8 +128,8 @@ struct MenuBarView: View {
             }
 
             // Settings
-            SettingsLink {
-                Text("Preferences...")
+            Button("Preferences...") {
+                openSettings()
             }
             .keyboardShortcut(",", modifiers: .command)
 
@@ -133,7 +155,7 @@ struct MenuBarView: View {
             return .orange
         case .processing:
             return .blue
-        case .downloading:
+        case .loadingModel:
             return .yellow
         case .error:
             return .red
@@ -143,24 +165,28 @@ struct MenuBarView: View {
     }
 
     private func initializeApp() async {
+        Log.app.info("Initializing app...")
+
         // Check permissions
         await checkMicrophonePermission()
         checkAccessibilityPermission()
 
         // Initialize managers
         audioManager = AudioCaptureManager()
-        transcriptionEngine = TranscriptionEngine()
+        let engine = TranscriptionEngine()
+        transcriptionEngine = engine
         overlayController = OverlayWindowController(appState: appState)
 
         // Set up hotkey manager with callbacks
+        // HotkeyManager is now @MainActor, so callbacks run directly on main
         hotkeyManager = HotkeyManager(
             onKeyDown: { [self] in
-                Task { @MainActor in
+                Task {
                     await startDictation()
                 }
             },
             onKeyUp: { [self] in
-                Task { @MainActor in
+                Task {
                     await stopDictation()
                 }
             }
@@ -171,9 +197,21 @@ struct MenuBarView: View {
             hotkeyManager?.start()
         }
 
-        // Check if model is already downloaded
-        if let engine = transcriptionEngine {
-            appState.isModelLoaded = await engine.isModelAvailable()
+        // Check if model is cached and auto-load if so
+        await checkModelStatus(engine: engine)
+    }
+
+    private func checkModelStatus(engine: TranscriptionEngine) async {
+        // Check if model is cached on disk
+        appState.isModelCached = await engine.isModelCached()
+        appState.cachedModelInfo = await engine.getCachedModelInfo()
+
+        Log.app.info("Model cached: \(appState.isModelCached)")
+
+        // Auto-load if cached (much faster than downloading)
+        if appState.isModelCached {
+            Log.app.info("Auto-loading cached model...")
+            await loadModel()
         }
     }
 
@@ -192,96 +230,120 @@ struct MenuBarView: View {
         }
     }
 
-    private func downloadModel() async {
-        guard let engine = transcriptionEngine else { return }
+    private func loadModel() async {
+        guard let engine = transcriptionEngine else {
+            Log.app.error("loadModel: transcriptionEngine is nil")
+            return
+        }
 
-        appState.dictationState = .downloading(progress: 0)
+        Log.transcription.info("Loading model...")
+        appState.dictationState = .loadingModel
 
         do {
-            try await engine.loadModel { progress in
-                Task { @MainActor in
-                    appState.dictationState = .downloading(progress: progress)
-                    appState.modelDownloadProgress = progress
-                }
-            }
+            try await engine.loadModel()
             appState.isModelLoaded = true
+            appState.isModelCached = true
+            appState.cachedModelInfo = await engine.getCachedModelInfo()
             appState.dictationState = .idle
+            Log.transcription.info("Model loaded successfully")
         } catch {
+            Log.transcription.error("Model loading failed: \(error.localizedDescription)")
             appState.dictationState = .error(error.localizedDescription)
         }
     }
 
     private func startDictation() async {
+        Log.app.info("startDictation() called")
+
         guard appState.allPermissionsGranted,
               appState.isModelLoaded,
-              let audioManager = audioManager,
-              let engine = transcriptionEngine else {
-            // If model not loaded, try to load it
+              let audioManager = audioManager else {
+            Log.app.warning("startDictation guard failed")
             if !appState.isModelLoaded {
-                await downloadModel()
+                await loadModel()
             }
             return
         }
+
+        // Reset transcription state
+        await transcriptionEngine?.resetState()
 
         appState.dictationState = .listening
         appState.showOverlay = true
         overlayController?.show()
 
-        // Start audio capture with level monitoring
+        // Start audio capture
         do {
             try audioManager.startCapture { levels in
                 Task { @MainActor in
                     appState.audioLevels = levels
                 }
             }
+            Log.audio.info("Recording started")
         } catch {
+            Log.audio.error("Audio capture failed: \(error.localizedDescription)")
             appState.dictationState = .error(error.localizedDescription)
-            return
-        }
-
-        // Start streaming transcription
-        audioManager.onAudioChunk = { audioData in
-            Task {
-                do {
-                    let text = try await engine.transcribe(audioData: audioData)
-                    if !text.isEmpty {
-                        await MainActor.run {
-                            textInjector.typeText(text)
-                        }
-                    }
-                } catch {
-                    await MainActor.run {
-                        appState.dictationState = .error(error.localizedDescription)
-                    }
-                }
-            }
         }
     }
 
     private func stopDictation() async {
-        guard let audioManager = audioManager,
-              let engine = transcriptionEngine else { return }
+        Log.app.info("stopDictation() called")
 
+        guard let audioManager = audioManager,
+              let engine = transcriptionEngine else {
+            Log.app.warning("stopDictation guard failed")
+            return
+        }
+
+        // Transition to processing state (overlay stays visible with spinner)
         appState.dictationState = .processing
 
-        // Stop audio capture and get final audio
-        let finalAudio = audioManager.stopCapture()
+        // Stop recording
+        let recordedAudio = audioManager.stopCapture()
+        Log.audio.info("Recording stopped: \(recordedAudio?.count ?? 0) bytes")
 
-        // Transcribe final chunk
-        if let audioData = finalAudio, !audioData.isEmpty {
+        // Transcribe
+        if let audioData = recordedAudio, !audioData.isEmpty {
             do {
                 let text = try await engine.transcribe(audioData: audioData)
                 if !text.isEmpty {
-                    textInjector.typeText(text)
+                    Log.injection.info("Injecting: '\(text)'")
+                    await textInjector.injectText(text)
+                }
+
+                // Record dictation session for WPM tracking
+                // Audio is 16kHz, 16-bit (2 bytes per sample) = 32000 bytes per second
+                // WAV header is 44 bytes
+                let audioBytes = audioData.count - 44
+                let audioDurationSeconds = Double(audioBytes) / 32000.0
+                let wordCount = text.split(whereSeparator: \.isWhitespace).count
+
+                let session = DictationSession(
+                    audioDurationSeconds: audioDurationSeconds,
+                    wordCount: wordCount
+                )
+                modelContext.insert(session)
+
+                do {
+                    try modelContext.save()
+                    let duration = String(format: "%.1f", audioDurationSeconds)
+                    Log.app.info("Recorded session: \(wordCount) words in \(duration)s")
+                } catch {
+                    Log.app.error("Failed to save session: \(error.localizedDescription)")
                 }
             } catch {
+                Log.transcription.error("Transcription error: \(error.localizedDescription)")
                 appState.dictationState = .error(error.localizedDescription)
+                overlayController?.hide()
+                appState.showOverlay = false
+                return
             }
         }
 
-        appState.dictationState = .idle
-        appState.showOverlay = false
-        appState.audioLevels = Array(repeating: 0, count: 20)
+        // Hide overlay after processing completes
         overlayController?.hide()
+        appState.showOverlay = false
+        appState.dictationState = .idle
+        appState.audioLevels = Array(repeating: 0, count: 14)
     }
 }

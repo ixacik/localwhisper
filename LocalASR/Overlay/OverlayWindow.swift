@@ -23,47 +23,42 @@ final class OverlayWindowController {
             createPanel()
         }
 
+        panel?.alphaValue = 1
         panel?.orderFrontRegardless()
-
-        // Animate in
-        panel?.alphaValue = 0
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
-            panel?.animator().alphaValue = 1
-        }
     }
 
     func hide() {
-        // Animate out
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
-            panel?.animator().alphaValue = 0
-        } completionHandler: { [weak self] in
-            self?.panel?.orderOut(nil)
-        }
+        panel?.orderOut(nil)
     }
 
     private func createPanel() {
         let panel = OverlayPanel()
 
         let hostingView = NSHostingView(rootView: OverlayView(appState: appState))
+        hostingView.layer?.backgroundColor = .clear
         panel.contentView = hostingView
 
         // Position at bottom center of screen
         if let screen = NSScreen.main {
-            let panelWidth: CGFloat = 280
-            let panelHeight: CGFloat = 72
-            let positionX = (screen.frame.width - panelWidth) / 2
-            let positionY: CGFloat = 80  // Distance from bottom
+            // Fixed size: content (50x6) + padding (32x24) = 82x30
+            let panelWidth: CGFloat = 82
+            let panelHeight: CGFloat = 30
+            // Must include screen origin for multi-monitor setups
+            let positionX = screen.frame.origin.x + (screen.frame.width - panelWidth) / 2
+            let positionY = screen.frame.origin.y + 60  // Distance from bottom
 
-            panel.setFrame(NSRect(x: positionX, y: positionY, width: panelWidth, height: panelHeight), display: true)
+            panel.setFrame(
+                NSRect(x: positionX, y: positionY, width: panelWidth, height: panelHeight),
+                display: true
+            )
         }
 
         self.panel = panel
     }
 }
 
-/// Custom NSPanel for the overlay
+/// Custom NSPanel for HUD-style overlay
+/// Configured to be always on top, click-through, and not recognized as a window
 final class OverlayPanel: NSPanel {
     override init(
         contentRect: NSRect,
@@ -73,7 +68,7 @@ final class OverlayPanel: NSPanel {
     ) {
         super.init(
             contentRect: contentRect,
-            styleMask: [.nonactivatingPanel, .fullSizeContentView, .borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -83,7 +78,7 @@ final class OverlayPanel: NSPanel {
 
     convenience init() {
         self.init(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: 72),
+            contentRect: NSRect(x: 0, y: 0, width: 82, height: 30),
             styleMask: [],
             backing: .buffered,
             defer: false
@@ -91,34 +86,34 @@ final class OverlayPanel: NSPanel {
     }
 
     private func configurePanel() {
-        // Panel behavior
-        level = .floating
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        // Window level: above everything including fullscreen apps
+        // Using a very high level to ensure it's always visible
+        level = .screenSaver
 
-        // Appearance
+        // Behavior: visible on all spaces, works with fullscreen
+        collectionBehavior = [
+            .canJoinAllSpaces,
+            .fullScreenAuxiliary,
+            .stationary,
+            .ignoresCycle
+        ]
+
+        // Appearance: transparent, no shadow for minimal look
         isOpaque = false
         backgroundColor = .clear
-        hasShadow = true
+        hasShadow = false
 
-        // Don't show in expose/mission control
+        // Click-through: mouse events pass to underlying windows
+        ignoresMouseEvents = true
+
+        // Don't show in Mission Control or app switcher
         hidesOnDeactivate = false
 
-        // Allow clicks to pass through to other apps
-        ignoresMouseEvents = false
-
-        // Vibrancy effect
-        let visualEffect = NSVisualEffectView()
-        visualEffect.material = .hudWindow
-        visualEffect.state = .active
-        visualEffect.blendingMode = .behindWindow
-        visualEffect.wantsLayer = true
-        visualEffect.layer?.cornerRadius = 16
-        visualEffect.layer?.masksToBounds = true
-
-        contentView = visualEffect
+        // Prevent becoming key or main window
+        // (handled by overrides below)
     }
 
-    // Prevent the panel from becoming key window
+    // Never become key window - we're just a HUD
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 }

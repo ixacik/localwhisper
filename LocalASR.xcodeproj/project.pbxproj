@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		74C98E812EEEBAD90008E8B1 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 74C98E712EEEB6000008E8B1 /* WhisperKit */; };
+		74C98E902EEF00000008E8B1 /* HotKey in Frameworks */ = {isa = PBXBuildFile; productRef = 74C98E912EEF00000008E8B1 /* HotKey */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -28,6 +29,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				74C98E812EEEBAD90008E8B1 /* WhisperKit in Frameworks */,
+				74C98E902EEF00000008E8B1 /* HotKey in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -71,6 +73,7 @@
 			name = LocalASR;
 			packageProductDependencies = (
 				74C98E712EEEB6000008E8B1 /* WhisperKit */,
+				74C98E912EEF00000008E8B1 /* HotKey */,
 			);
 			productName = LocalASR;
 			productReference = 74C98E512EEEB5D70008E8B1 /* LocalASR.app */;
@@ -102,6 +105,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				74C98E702EEEB6000008E8B1 /* XCRemoteSwiftPackageReference "WhisperKit" */,
+				74C98E922EEF00000008E8B1 /* XCRemoteSwiftPackageReference "HotKey" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 74C98E522EEEB5D70008E8B1 /* Products */;
@@ -264,10 +268,9 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = YBLT7UYG8B;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -299,10 +302,9 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = YBLT7UYG8B;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -356,6 +358,14 @@
 				minimumVersion = 0.9.0;
 			};
 		};
+		74C98E922EEF00000008E8B1 /* XCRemoteSwiftPackageReference "HotKey" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/soffes/HotKey.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.2.1;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -363,6 +373,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 74C98E702EEEB6000008E8B1 /* XCRemoteSwiftPackageReference "WhisperKit" */;
 			productName = WhisperKit;
+		};
+		74C98E912EEF00000008E8B1 /* HotKey */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 74C98E922EEF00000008E8B1 /* XCRemoteSwiftPackageReference "HotKey" */;
+			productName = HotKey;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

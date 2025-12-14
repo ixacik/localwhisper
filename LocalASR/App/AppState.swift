@@ -25,7 +25,7 @@ final class AppState {
         case idle
         case listening
         case processing
-        case downloading(progress: Double)
+        case loadingModel
         case error(String)
     }
 
@@ -35,12 +35,28 @@ final class AppState {
         dictationState == .listening
     }
 
-    // MARK: - Audio Levels
-    var audioLevels: [Float] = Array(repeating: 0, count: 20)
+    var isLoadingModel: Bool {
+        dictationState == .loadingModel
+    }
+
+    // MARK: - Audio Levels (frequency spectrum, 14 bands)
+    var audioLevels: [Float] = Array(repeating: 0, count: 14)
 
     // MARK: - Model State
     var isModelLoaded = false
-    var modelDownloadProgress: Double = 0
+    var isModelCached = false
+    var cachedModelInfo: CachedModelInfo?
+
+    /// Button text for model action
+    var modelActionText: String {
+        if isModelLoaded {
+            return "Model Loaded"
+        } else if isModelCached {
+            return "Load Model"
+        } else {
+            return "Download Model (~1.5 GB)"
+        }
+    }
 
     // MARK: - Overlay
     var showOverlay = false
@@ -49,13 +65,16 @@ final class AppState {
     var statusMessage: String {
         switch dictationState {
         case .idle:
-            return allPermissionsGranted ? "Ready — Hold ⌘⎋ to dictate" : "Setup required"
+            if !allPermissionsGranted {
+                return "Setup required"
+            }
+            return isModelLoaded ? "Ready — Hold ⌘⎋ to dictate" : "Model not loaded"
         case .listening:
             return "Listening..."
         case .processing:
             return "Processing..."
-        case .downloading(let progress):
-            return "Downloading model: \(Int(progress * 100))%"
+        case .loadingModel:
+            return isModelCached ? "Loading model..." : "Downloading model..."
         case .error(let message):
             return "Error: \(message)"
         }

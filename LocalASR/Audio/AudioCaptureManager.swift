@@ -27,16 +27,6 @@ final class AudioBuffer: @unchecked Sendable {
         return result
     }
 
-    func getAndKeepOverlap(overlapCount: Int) -> [Float] {
-        lock.lock()
-        let result = samples
-        if samples.count > overlapCount {
-            samples = Array(samples.suffix(overlapCount))
-        }
-        lock.unlock()
-        return result
-    }
-
     func clear() {
         lock.lock()
         samples.removeAll()
@@ -44,8 +34,8 @@ final class AudioBuffer: @unchecked Sendable {
     }
 }
 
-/// Manages audio capture from the microphone with level monitoring
-/// Provides audio data chunks for transcription
+/// Manages audio capture from the microphone with frequency spectrum analysis
+/// Records audio until stopped, then returns the complete recording as WAV data
 @MainActor
 final class AudioCaptureManager {
     private let engine = AVAudioEngine()
@@ -54,30 +44,40 @@ final class AudioCaptureManager {
     // Thread-safe audio buffer
     private let audioBuffer = AudioBuffer()
 
-    // Chunk settings for streaming transcription
-    private let chunkDuration: TimeInterval = 2.0  // Send chunks every 2 seconds
-    private var lastChunkTime: Date?
+    // Callback for frequency spectrum visualization
+    var onFrequencyLevels: (([Float]) -> Void)?
 
-    // Callbacks
-    var onAudioLevels: (([Float]) -> Void)?
-    var onAudioChunk: ((Data) -> Void)?
-
-    // Level history for visualization
-    private var levelHistory: [Float] = Array(repeating: 0, count: 20)
+    // FFT setup
+    private let fftSize = 1024
+    private var fftSetup: vDSP_DFT_Setup?
+    private let frequencyBandCount = 14  // Number of frequency bands to display
 
     // Target format for Whisper: 16kHz mono
     private let targetSampleRate: Double = 16000
 
-    init() {}
+    init() {
+        // Create FFT setup
+        fftSetup = vDSP_DFT_zop_CreateSetup(
+            nil,
+            vDSP_Length(fftSize),
+            .FORWARD
+        )
+    }
+
+    deinit {
+        if let setup = fftSetup {
+            vDSP_DFT_DestroySetup(setup)
+        }
+    }
 
     // MARK: - Permission Handling
 
-    static func checkPermission() async -> Bool {
-        return AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    nonisolated static func checkPermission() async -> Bool {
+        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     }
 
-    static func requestPermission() async -> Bool {
-        return await withCheckedContinuation { continuation in
+    nonisolated static func requestPermission() async -> Bool {
+        await withCheckedContinuation { continuation in
             AVCaptureDevice.requestAccess(for: .audio) { granted in
                 continuation.resume(returning: granted)
             }
@@ -86,10 +86,13 @@ final class AudioCaptureManager {
 
     // MARK: - Capture Control
 
+    /// Start recording audio from the microphone
+    /// - Parameter onLevels: Callback for real-time frequency spectrum (for visualization)
     func startCapture(onLevels: @escaping ([Float]) -> Void) throws {
         guard !isCapturing else { return }
 
-        onAudioLevels = onLevels
+        onFrequencyLevels = onLevels
+        audioBuffer.clear()
 
         let inputNode = engine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
@@ -107,12 +110,22 @@ final class AudioCaptureManager {
         }
 
         let buffer = self.audioBuffer
-        let sampleRate = self.targetSampleRate
-        let chunkDuration = self.chunkDuration
+        let fftSize = self.fftSize
+        let bandCount = self.frequencyBandCount
+
+        // Capture setup for FFT
+        let setup = self.fftSetup
 
         // Install tap on input node
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] pcmBuffer, _ in
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: UInt32(fftSize),
+            format: inputFormat
+        ) { [weak self] pcmBuffer, _ in
+            guard let self = self else { return }
+
             // Convert to target format
+            let sampleRate = self.targetSampleRate
             let frameCount = AVAudioFrameCount(
                 Double(pcmBuffer.frameLength) * sampleRate / inputFormat.sampleRate
             )
@@ -135,42 +148,33 @@ final class AudioCaptureManager {
             guard let channelData = convertedBuffer.floatChannelData?[0] else { return }
             let frameLength = Int(convertedBuffer.frameLength)
 
-            // Calculate RMS level for visualization
-            var rmsValue: Float = 0
-            vDSP_rmsqv(channelData, 1, &rmsValue, vDSP_Length(frameLength))
-            let scaledLevel = min(rmsValue * 10, 1.0)
-
-            // Accumulate audio samples
+            // Accumulate audio samples for recording
             let samples = Array(UnsafeBufferPointer(start: channelData, count: frameLength))
             buffer.append(samples)
 
+            // Compute frequency spectrum for visualization
+            let spectrum = self.computeFrequencySpectrum(
+                samples: samples,
+                fftSetup: setup,
+                fftSize: fftSize,
+                bandCount: bandCount
+            )
+
             // Update UI on main thread
             Task { @MainActor [weak self] in
-                guard let self = self else { return }
-
-                // Update level history
-                self.levelHistory.removeFirst()
-                self.levelHistory.append(scaledLevel)
-                self.onAudioLevels?(self.levelHistory)
-
-                // Check if we should send a chunk
-                if let lastTime = self.lastChunkTime,
-                   Date().timeIntervalSince(lastTime) >= chunkDuration {
-                    self.sendAudioChunk()
-                }
+                self?.onFrequencyLevels?(spectrum)
             }
         }
 
         engine.prepare()
         try engine.start()
-
         isCapturing = true
-        lastChunkTime = Date()
-        audioBuffer.clear()
 
-        print("Audio capture started")
+        Log.audio.info("Recording started")
     }
 
+    /// Stop recording and return the complete audio as WAV data
+    /// - Returns: WAV-formatted audio data, or nil if no audio was recorded
     func stopCapture() -> Data? {
         guard isCapturing else { return nil }
 
@@ -178,25 +182,93 @@ final class AudioCaptureManager {
         engine.stop()
         isCapturing = false
 
-        // Return any remaining audio
-        let finalAudio = audioBuffer.getAndClear()
+        let samples = audioBuffer.getAndClear()
+        let duration = Double(samples.count) / targetSampleRate
 
-        print("Audio capture stopped, \(finalAudio.count) samples remaining")
+        Log.audio.info("Recording stopped: \(samples.count) samples (\(String(format: "%.1f", duration))s)")
 
-        return convertToWavData(samples: finalAudio)
+        return convertToWavData(samples: samples)
     }
 
-    // MARK: - Audio Processing
+    // MARK: - Frequency Spectrum Analysis
 
-    private func sendAudioChunk() {
-        let overlapSamples = Int(targetSampleRate * 0.5)
-        let chunkSamples = audioBuffer.getAndKeepOverlap(overlapCount: overlapSamples)
-
-        lastChunkTime = Date()
-
-        if let wavData = convertToWavData(samples: chunkSamples) {
-            onAudioChunk?(wavData)
+    /// Compute frequency spectrum using FFT
+    /// Returns normalized power levels for each frequency band
+    private nonisolated func computeFrequencySpectrum(
+        samples: [Float],
+        fftSetup: vDSP_DFT_Setup?,
+        fftSize: Int,
+        bandCount: Int
+    ) -> [Float] {
+        guard let setup = fftSetup, samples.count >= fftSize else {
+            return Array(repeating: 0, count: bandCount)
         }
+
+        // Take the last fftSize samples
+        let fftSamples = Array(samples.suffix(fftSize))
+
+        // Apply Hann window to reduce spectral leakage
+        var window = [Float](repeating: 0, count: fftSize)
+        vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
+
+        var windowedSamples = [Float](repeating: 0, count: fftSize)
+        vDSP_vmul(fftSamples, 1, window, 1, &windowedSamples, 1, vDSP_Length(fftSize))
+
+        // Prepare for FFT (split complex format)
+        var realInput = [Float](repeating: 0, count: fftSize)
+        var imagInput = [Float](repeating: 0, count: fftSize)
+        var realOutput = [Float](repeating: 0, count: fftSize)
+        var imagOutput = [Float](repeating: 0, count: fftSize)
+
+        realInput = windowedSamples
+
+        // Perform FFT
+        vDSP_DFT_Execute(setup, &realInput, &imagInput, &realOutput, &imagOutput)
+
+        // Compute magnitudes (only need first half due to symmetry)
+        let halfSize = fftSize / 2
+        var magnitudes = [Float](repeating: 0, count: halfSize)
+
+        for idx in 0..<halfSize {
+            let real = realOutput[idx]
+            let imag = imagOutput[idx]
+            magnitudes[idx] = sqrtf(real * real + imag * imag)
+        }
+
+        // Convert to dB and normalize
+        var logMagnitudes = [Float](repeating: 0, count: halfSize)
+        var one: Float = 1
+        vDSP_vdbcon(magnitudes, 1, &one, &logMagnitudes, 1, vDSP_Length(halfSize), 0)
+
+        // Group into frequency bands (logarithmic spacing for perceptual accuracy)
+        var bands = [Float](repeating: 0, count: bandCount)
+
+        for band in 0..<bandCount {
+            // Logarithmic band edges
+            let lowBin = Int(pow(Float(halfSize), Float(band) / Float(bandCount)))
+            let highBin = Int(pow(Float(halfSize), Float(band + 1) / Float(bandCount)))
+            let clampedLow = max(1, lowBin)
+            let clampedHigh = min(halfSize - 1, max(clampedLow + 1, highBin))
+
+            // Average power in this band
+            var sum: Float = 0
+            for bin in clampedLow..<clampedHigh {
+                sum += logMagnitudes[bin]
+            }
+            bands[band] = sum / Float(clampedHigh - clampedLow)
+        }
+
+        // Normalize to 0-1 range
+        // Typical dB range for speech: -60 to 0 dB
+        let minDb: Float = -60
+        let maxDb: Float = 0
+
+        for idx in 0..<bandCount {
+            let normalized = (bands[idx] - minDb) / (maxDb - minDb)
+            bands[idx] = max(0, min(1, normalized))
+        }
+
+        return bands
     }
 
     // MARK: - WAV Conversion
@@ -204,10 +276,9 @@ final class AudioCaptureManager {
     private nonisolated func convertToWavData(samples: [Float]) -> Data? {
         guard !samples.isEmpty else { return nil }
 
-        // Create WAV file in memory
         var data = Data()
 
-        // WAV header
+        // WAV header parameters
         let sampleRate = UInt32(16000)
         let channels: UInt16 = 1
         let bitsPerSample: UInt16 = 16
@@ -223,8 +294,8 @@ final class AudioCaptureManager {
 
         // fmt chunk
         data.append(contentsOf: "fmt ".utf8)
-        data.append(contentsOf: withUnsafeBytes(of: UInt32(16).littleEndian) { Array($0) })  // chunk size
-        data.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })   // PCM format
+        data.append(contentsOf: withUnsafeBytes(of: UInt32(16).littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })
         data.append(contentsOf: withUnsafeBytes(of: channels.littleEndian) { Array($0) })
         data.append(contentsOf: withUnsafeBytes(of: sampleRate.littleEndian) { Array($0) })
         data.append(contentsOf: withUnsafeBytes(of: byteRate.littleEndian) { Array($0) })

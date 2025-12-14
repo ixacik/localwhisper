@@ -6,32 +6,108 @@
 //
 
 import SwiftUI
+import SwiftData
 
 struct PreferencesView: View {
     @Bindable var appState: AppState
+    @Binding var transcriptionEngine: TranscriptionEngine?
+    @Query private var sessions: [DictationSession]
     @State private var selectedTab = 0
 
-    var body: some View {
-        TabView(selection: $selectedTab) {
-            GeneralPreferencesView(appState: appState)
-                .tabItem {
-                    Label("General", systemImage: "gear")
-                }
-                .tag(0)
+    private var totalSeconds: Double {
+        sessions.reduce(0) { $0 + $1.audioDurationSeconds }
+    }
 
-            PermissionsPreferencesView(appState: appState)
-                .tabItem {
-                    Label("Permissions", systemImage: "lock.shield")
-                }
-                .tag(1)
+    private var totalWords: Int {
+        sessions.reduce(0) { $0 + $1.wordCount }
+    }
 
-            AboutPreferencesView()
-                .tabItem {
-                    Label("About", systemImage: "info.circle")
-                }
-                .tag(2)
+    private var averageWPM: Double {
+        guard totalSeconds > 0 else { return 0 }
+        return (Double(totalWords) / totalSeconds) * 60
+    }
+
+    private var formattedDuration: String {
+        let minutes = Int(totalSeconds) / 60
+        let seconds = Int(totalSeconds) % 60
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        } else {
+            return "\(seconds)s"
         }
-        .frame(width: 450, height: 300)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Stats header
+            StatsHeaderView(
+                averageWPM: averageWPM,
+                formattedDuration: formattedDuration,
+                hasData: !sessions.isEmpty
+            )
+
+            Divider()
+
+            TabView(selection: $selectedTab) {
+                GeneralPreferencesView(appState: appState)
+                    .tabItem {
+                        Label("General", systemImage: "gear")
+                    }
+                    .tag(0)
+
+                ModelPreferencesView(appState: appState, transcriptionEngine: $transcriptionEngine)
+                    .tabItem {
+                        Label("Model", systemImage: "cpu")
+                    }
+                    .tag(1)
+
+                PermissionsPreferencesView(appState: appState)
+                    .tabItem {
+                        Label("Permissions", systemImage: "lock.shield")
+                    }
+                    .tag(2)
+
+                AboutPreferencesView()
+                    .tabItem {
+                        Label("About", systemImage: "info.circle")
+                    }
+                    .tag(3)
+            }
+        }
+        .frame(width: 480, height: 400)
+    }
+}
+
+// MARK: - Stats Header
+
+struct StatsHeaderView: View {
+    let averageWPM: Double
+    let formattedDuration: String
+    let hasData: Bool
+
+    var body: some View {
+        VStack(spacing: 4) {
+            if hasData {
+                Text("\(Int(averageWPM)) WPM")
+                    .font(.system(size: 28, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+
+                Text("Based on \(formattedDuration) of dictation")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("No Data Yet")
+                    .font(.system(size: 20, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+
+                Text("Start dictating to track your WPM")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 16)
+        .background(.ultraThinMaterial)
     }
 }
 
@@ -70,25 +146,191 @@ struct GeneralPreferencesView: View {
                 Text("Hold the hotkey to start dictation, release to stop.")
                     .foregroundStyle(.secondary)
             }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
 
+// MARK: - Model Preferences
+
+struct ModelPreferencesView: View {
+    @Bindable var appState: AppState
+    @Binding var transcriptionEngine: TranscriptionEngine?
+    @State private var isDeleting = false
+    @State private var showDeleteConfirmation = false
+
+    var body: some View {
+        Form {
             Section {
+                // Model status
                 HStack {
-                    Text("Model")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Status")
+                            .fontWeight(.medium)
+                        Text(statusDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     Spacer()
-                    if appState.isModelLoaded {
-                        Label("distil-large-v3", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                    } else {
-                        Text("Not loaded")
+
+                    statusBadge
+                }
+
+                // Model info (if cached)
+                if let info = appState.cachedModelInfo {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Model")
+                                .fontWeight(.medium)
+                            Text(info.name)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        Text(info.formattedSize)
                             .foregroundStyle(.secondary)
                     }
                 }
             } header: {
-                Text("Transcription")
+                Text("WhisperKit Model")
+            }
+
+            Section {
+                if appState.isModelCached || appState.isModelLoaded {
+                    // Delete model button
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Delete Model")
+                                .fontWeight(.medium)
+                            Text("Remove cached model to free up disk space")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        if isDeleting {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Button("Delete", role: .destructive) {
+                                showDeleteConfirmation = true
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+                } else {
+                    // Download model button
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Download Model")
+                                .fontWeight(.medium)
+                            Text("Download the WhisperKit model (~1.5 GB)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        if appState.isLoadingModel {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Button("Download") {
+                                Task { await downloadModel() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+                    }
+                }
+            } header: {
+                Text("Storage")
+            } footer: {
+                Text("Models are stored in ~/Library/Application Support/WhisperKit/")
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
         .padding()
+        .confirmationDialog(
+            "Delete Model?",
+            isPresented: $showDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                Task { await deleteModel() }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This will remove the cached model from disk. You'll need to download it again to use LocalASR.")
+        }
+    }
+
+    private var statusDescription: String {
+        if appState.isModelLoaded {
+            return "Model is loaded and ready"
+        } else if appState.isModelCached {
+            return "Model is cached but not loaded"
+        } else {
+            return "Model not downloaded"
+        }
+    }
+
+    @ViewBuilder
+    private var statusBadge: some View {
+        if appState.isModelLoaded {
+            Label("Ready", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .font(.caption)
+        } else if appState.isModelCached {
+            Label("Cached", systemImage: "arrow.down.circle.fill")
+                .foregroundStyle(.blue)
+                .font(.caption)
+        } else {
+            Label("Not Downloaded", systemImage: "xmark.circle.fill")
+                .foregroundStyle(.secondary)
+                .font(.caption)
+        }
+    }
+
+    private func downloadModel() async {
+        guard let engine = transcriptionEngine else { return }
+
+        appState.dictationState = .loadingModel
+
+        do {
+            try await engine.loadModel()
+            appState.isModelLoaded = true
+            appState.isModelCached = true
+            appState.cachedModelInfo = await engine.getCachedModelInfo()
+            appState.dictationState = .idle
+        } catch {
+            appState.dictationState = .error(error.localizedDescription)
+        }
+    }
+
+    private func deleteModel() async {
+        guard let engine = transcriptionEngine else { return }
+
+        isDeleting = true
+
+        do {
+            try await engine.deleteModelCache()
+            appState.isModelLoaded = false
+            appState.isModelCached = false
+            appState.cachedModelInfo = nil
+            appState.dictationState = .idle
+        } catch {
+            appState.dictationState = .error(error.localizedDescription)
+        }
+
+        isDeleting = false
     }
 }
 
@@ -118,6 +360,7 @@ struct PermissionsPreferencesView: View {
                     isGranted: appState.hasAccessibilityPermission,
                     action: {
                         AccessibilityHelper.requestPermission()
+                        AccessibilityHelper.openAccessibilityPreferences()
                     }
                 )
             } header: {
@@ -218,5 +461,7 @@ struct AboutPreferencesView: View {
 }
 
 #Preview {
-    PreferencesView(appState: AppState())
+    @Previewable @State var engine: TranscriptionEngine? = TranscriptionEngine()
+    PreferencesView(appState: AppState(), transcriptionEngine: $engine)
+        .modelContainer(for: DictationSession.self, inMemory: true)
 }

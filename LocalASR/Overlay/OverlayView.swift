@@ -7,82 +7,95 @@
 
 import SwiftUI
 
-/// Main overlay view showing waveform and status
+/// Ultra-minimal overlay that morphs between listening (dots) and processing (linear loader)
+/// Uses fixed dimensions to prevent size changes during state transitions
 struct OverlayView: View {
     @Bindable var appState: AppState
 
+    private let dotCount = 5
+    private let contentWidth: CGFloat = 50
+    private let contentHeight: CGFloat = 6
+
+    private var isProcessing: Bool {
+        appState.dictationState == .processing
+    }
+
     var body: some View {
-        HStack(spacing: 16) {
-            // Microphone icon
-            Image(systemName: microphoneIcon)
-                .font(.system(size: 24, weight: .medium))
-                .foregroundStyle(iconColor)
-                .frame(width: 32)
-                .symbolEffect(.pulse, isActive: appState.isListening)
+            ZStack {
+                // Listening state: 5 audio-reactive dots
+                if !isProcessing {
+                    listeningContent
+                        .transition(.opacity)
+                }
+                
+                // Processing state: linear loader
+                if isProcessing {
+                    processingContent
+                        .transition(.opacity)
+                }
+            }
+            .frame(width: contentWidth, height: contentHeight)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(.thinMaterial)
+            }
+            .animation(.easeInOut(duration: 0.2), value: isProcessing)
+    }
 
-            // Waveform visualizer
-            WaveformView(levels: appState.audioLevels)
-                .frame(height: 40)
+    // MARK: - Listening Content (5 dots)
 
-            // Status indicator
-            Circle()
-                .fill(statusColor)
-                .frame(width: 10, height: 10)
-                .shadow(color: statusColor.opacity(0.5), radius: 4)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .background {
-            RoundedRectangle(cornerRadius: 16)
-                .fill(.ultraThinMaterial)
-                .shadow(color: .black.opacity(0.2), radius: 20, y: 10)
+    private var listeningContent: some View {
+        HStack(spacing: 5) {
+            ForEach(0..<dotCount, id: \.self) { index in
+                Circle()
+                    .fill(.white.opacity(dotOpacity(for: index)))
+                    .frame(width: 6, height: 6)
+            }
         }
     }
 
-    private var microphoneIcon: String {
-        switch appState.dictationState {
-        case .listening:
-            return "mic.fill"
-        case .processing:
-            return "ellipsis.circle.fill"
-        default:
-            return "mic"
-        }
+    // MARK: - Processing Content (linear loader)
+
+    private var processingContent: some View {
+        ProgressView()
+            .progressViewStyle(.linear)
+            .controlSize(.mini)
+            .tint(.white)
     }
 
-    private var iconColor: Color {
-        switch appState.dictationState {
-        case .listening:
-            return .red
-        case .processing:
-            return .blue
-        case .error:
-            return .orange
-        default:
-            return .primary
-        }
-    }
+    // MARK: - Helpers
 
-    private var statusColor: Color {
-        switch appState.dictationState {
-        case .listening:
-            return .red
-        case .processing:
-            return .blue
-        case .error:
-            return .orange
-        default:
-            return .green
+    private func dotOpacity(for index: Int) -> Double {
+        let level: Float
+        if appState.audioLevels.indices.contains(index) {
+            level = appState.audioLevels[index]
+        } else {
+            level = 0
         }
+        // Map level to opacity: 0.2 (silent) to 1.0 (loud)
+        return 0.2 + Double(level) * 0.8
     }
 }
 
-#Preview {
+// MARK: - Previews
+
+#Preview("Listening") {
     let state = AppState()
     state.dictationState = .listening
-    state.audioLevels = (0..<20).map { _ in Float.random(in: 0...1) }
+    state.audioLevels = [0.2, 0.5, 0.8, 0.6, 0.3]
 
     return OverlayView(appState: state)
-        .frame(width: 280, height: 72)
-        .background(.black.opacity(0.5))
+        .padding(40)
+        .background(.gray)
+}
+
+#Preview("Processing") {
+    let state = AppState()
+    state.dictationState = .processing
+
+    return OverlayView(appState: state)
+        .padding(40)
+        .background(.gray)
 }

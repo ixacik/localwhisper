@@ -9,129 +9,83 @@ import Foundation
 import AppKit
 import CoreGraphics
 import Carbon.HIToolbox
+import os
 
-/// Injects text into the currently focused text field using keyboard simulation
+/// Injects text into the currently focused text field via clipboard paste.
+///
+/// This is the most reliable cross-app solution on macOS, used by Alfred, Raycast,
+/// Espanso, and Keyboard Maestro. Works in ~99% of apps including terminals and browsers.
 @MainActor
 final class TextInjector {
-    private let typingDelay: TimeInterval = 0.001  // Small delay between characters
 
-    init() {}
-
-    /// Type text into the currently focused text field
-    /// Uses CGEvent to simulate keyboard input
-    func typeText(_ text: String) {
-        guard !text.isEmpty else { return }
-
-        let source = CGEventSource(stateID: .hidSystemState)
-
-        // Type each character
-        for char in text {
-            typeCharacter(char, source: source)
-        }
+    init() {
+        Log.injection.info("TextInjector initialized")
     }
 
-    /// Type a single character using CGEvent
-    private func typeCharacter(_ char: Character, source: CGEventSource?) {
-        let string = String(char)
+    // MARK: - Public API
 
-        // Create key down event
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) else {
+    /// Inject text into the focused field via clipboard paste (⌘V)
+    func injectText(_ text: String) async {
+        guard !text.isEmpty else {
+            Log.injection.warning("injectText called with empty string")
             return
         }
 
-        // Create key up event
-        guard let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+        Log.injection.info("Injecting \(text.count) characters")
+
+        // Get the frontmost application's PID
+        guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
+            Log.injection.error("Could not get frontmost application")
             return
         }
+        let pid = frontmostApp.processIdentifier
+        Log.injection.debug("Target: \(frontmostApp.localizedName ?? "unknown") (pid: \(pid))")
 
-        // Set the unicode string for both events
-        var unicodeChars = Array(string.utf16)
-        keyDown.keyboardSetUnicodeString(stringLength: unicodeChars.count, unicodeString: &unicodeChars)
-        keyUp.keyboardSetUnicodeString(stringLength: unicodeChars.count, unicodeString: &unicodeChars)
-
-        // Post the events
-        keyDown.post(tap: .cgAnnotatedSessionEventTap)
-        keyUp.post(tap: .cgAnnotatedSessionEventTap)
-    }
-
-    /// Type text with special key support (e.g., newlines, tabs)
-    func typeTextWithSpecialKeys(_ text: String) {
-        guard !text.isEmpty else { return }
-
-        let source = CGEventSource(stateID: .hidSystemState)
-
-        for char in text {
-            switch char {
-            case "\n":
-                pressKey(keyCode: VirtualKey.returnKey, source: source)
-            case "\t":
-                pressKey(keyCode: VirtualKey.tab, source: source)
-            case "\r":
-                // Ignore carriage returns
-                continue
-            default:
-                typeCharacter(char, source: source)
-            }
-        }
-    }
-
-    /// Press a specific key by keycode
-    private func pressKey(keyCode: Int, source: CGEventSource?) {
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode), keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode), keyDown: false) else {
-            return
-        }
-
-        keyDown.post(tap: .cgAnnotatedSessionEventTap)
-        keyUp.post(tap: .cgAnnotatedSessionEventTap)
-    }
-
-    /// Paste text from clipboard (faster for long text)
-    func pasteText(_ text: String) {
-        // Save current clipboard
         let pasteboard = NSPasteboard.general
+
+        // Save current clipboard contents
         let previousContents = pasteboard.string(forType: .string)
 
-        // Set new text
+        // Set our text to clipboard
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
-        // Simulate Cmd+V
-        let source = CGEventSource(stateID: .hidSystemState)
+        // Small delay to ensure clipboard is ready
+        try? await Task.sleep(for: .milliseconds(10))
 
-        let keyCode = CGKeyCode(VirtualKey.keyV)
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
+        // Create ⌘V key events
+        let vKeyCode = CGKeyCode(kVK_ANSI_V)
+
+        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: vKeyCode, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: vKeyCode, keyDown: false) else {
+            Log.injection.error("Failed to create paste key events")
+            restoreClipboard(previous: previousContents)
             return
         }
 
         keyDown.flags = .maskCommand
         keyUp.flags = .maskCommand
 
-        keyDown.post(tap: .cgAnnotatedSessionEventTap)
-        keyUp.post(tap: .cgAnnotatedSessionEventTap)
+        // Post directly to the frontmost application's process
+        keyDown.postToPid(pid)
+        keyUp.postToPid(pid)
 
-        // Restore previous clipboard after a delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            if let previous = previousContents {
-                pasteboard.clearContents()
-                pasteboard.setString(previous, forType: .string)
-            }
+        Log.injection.info("Pasted via ⌘V to pid \(pid)")
+
+        // Wait for paste to complete before restoring clipboard
+        try? await Task.sleep(for: .milliseconds(100))
+
+        // Restore previous clipboard contents
+        restoreClipboard(previous: previousContents)
+    }
+
+    // MARK: - Private
+
+    private func restoreClipboard(previous: String?) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        if let previous {
+            pasteboard.setString(previous, forType: .string)
         }
     }
-}
-
-// MARK: - Virtual Key Codes
-
-private enum VirtualKey {
-    static let returnKey: Int = 0x24
-    static let tab: Int = 0x30
-    static let space: Int = 0x31
-    static let delete: Int = 0x33
-    static let escape: Int = 0x35
-    static let command: Int = 0x37
-    static let shift: Int = 0x38
-    static let option: Int = 0x3A
-    static let control: Int = 0x3B
-    static let keyV: Int = 0x09
 }

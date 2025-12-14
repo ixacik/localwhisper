@@ -5,154 +5,164 @@
 //  Created on 14/12/2025.
 //
 
-import Foundation
-import CoreGraphics
+import AppKit
 import Carbon.HIToolbox
+import HotKey
+import os
 
 /// Manages global hotkey detection for push-to-talk functionality
-/// Uses CGEvent tap to intercept Cmd+Escape key events system-wide
-final class HotkeyManager: @unchecked Sendable {
-    private var eventTap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
-    private var isRunning = false
-    private var isKeyDown = false
+/// Uses HotKey library (Carbon RegisterEventHotKey) for reliable cross-app detection
+@MainActor
+final class HotkeyManager {
+    private var hotKey: HotKey?
 
-    private let onKeyDown: @Sendable () -> Void
-    private let onKeyUp: @Sendable () -> Void
+    /// Fallback: poll modifier keys to detect stuck state
+    private var modifierPollTimer: Timer?
 
-    // Target hotkey: Cmd + Escape (keycode 53)
-    private let targetKeyCode: CGKeyCode = 53  // Escape key
-    private let targetModifiers: CGEventFlags = .maskCommand
+    /// Safety timeout to prevent infinite listening
+    private var safetyTimeoutTask: Task<Void, Never>?
 
-    init(onKeyDown: @escaping @Sendable () -> Void, onKeyUp: @escaping @Sendable () -> Void) {
+    /// Maximum recording duration before auto-stopping (safety)
+    private let maxRecordingDuration: TimeInterval = 60
+
+    /// Polling interval for modifier key state
+    private let modifierPollInterval: TimeInterval = 0.1
+
+    private let onKeyDown: @MainActor () -> Void
+    private let onKeyUp: @MainActor () -> Void
+
+    private(set) var isActive = false
+
+    init(onKeyDown: @escaping @MainActor () -> Void, onKeyUp: @escaping @MainActor () -> Void) {
         self.onKeyDown = onKeyDown
         self.onKeyUp = onKeyUp
     }
 
-    deinit {
-        stop()
-    }
+    // MARK: - Public API
 
-    /// Start monitoring for the hotkey
+    /// Start monitoring for the hotkey (⌘+Escape)
     func start() {
-        guard !isRunning else { return }
+        guard hotKey == nil else { return }
 
-        // Create event tap
-        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue) |
-                                      (1 << CGEventType.keyUp.rawValue) |
-                                      (1 << CGEventType.flagsChanged.rawValue)
+        // Register ⌘+Escape using Carbon APIs (via HotKey library)
+        // This works reliably even in Secure Input mode (terminals, password fields)
+        let hotKey = HotKey(key: .escape, modifiers: [.command])
 
-        // We need to pass self to the callback, so we use Unmanaged
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-
-        guard let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: eventMask,
-            callback: { proxy, type, event, refcon -> Unmanaged<CGEvent>? in
-                guard let refcon = refcon else {
-                    return Unmanaged.passRetained(event)
-                }
-
-                let manager = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue()
-                return manager.handleEvent(proxy: proxy, type: type, event: event)
-            },
-            userInfo: selfPtr
-        ) else {
-            print("Failed to create event tap. Accessibility permission may not be granted.")
-            return
+        hotKey.keyDownHandler = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleKeyDown()
+            }
         }
 
-        eventTap = tap
-        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-
-        if let source = runLoopSource {
-            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        hotKey.keyUpHandler = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleKeyUp()
+            }
         }
 
-        CGEvent.tapEnable(tap: tap, enable: true)
-        isRunning = true
-
-        print("Hotkey manager started - listening for Cmd+Escape")
+        self.hotKey = hotKey
+        Log.hotkey.info("Hotkey manager started - listening for ⌘⎋")
     }
 
     /// Stop monitoring for the hotkey
     func stop() {
-        guard isRunning else { return }
-
-        if let tap = eventTap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-        }
-
-        if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
-        }
-
-        eventTap = nil
-        runLoopSource = nil
-        isRunning = false
-        isKeyDown = false
-
-        print("Hotkey manager stopped")
+        stopSafetyMechanisms()
+        hotKey = nil
+        isActive = false
+        Log.hotkey.info("Hotkey manager stopped")
     }
 
-    private func handleEvent(
-        proxy: CGEventTapProxy,
-        type: CGEventType,
-        event: CGEvent
-    ) -> Unmanaged<CGEvent>? {
-        // Handle tap being disabled (e.g., by system timeout)
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap = eventTap {
-                CGEvent.tapEnable(tap: tap, enable: true)
+    /// Force reset the active state (escape hatch for stuck detection)
+    func forceReset() {
+        guard isActive else { return }
+        Log.hotkey.warning("Force resetting hotkey state")
+        handleKeyUp()
+    }
+
+    // MARK: - Event Handling
+
+    private func handleKeyDown() {
+        guard !isActive else { return }
+
+        isActive = true
+        Log.hotkey.debug("⌘⎋ pressed")
+
+        // Start safety mechanisms
+        startModifierPolling()
+        startSafetyTimeout()
+
+        onKeyDown()
+    }
+
+    private func handleKeyUp() {
+        guard isActive else { return }
+
+        isActive = false
+        Log.hotkey.debug("⌘⎋ released")
+
+        // Stop safety mechanisms
+        stopSafetyMechanisms()
+
+        onKeyUp()
+    }
+
+    // MARK: - Safety Mechanisms
+
+    /// Start polling modifier keys to detect if Cmd was released without us receiving the event
+    private func startModifierPolling() {
+        modifierPollTimer?.invalidate()
+
+        modifierPollTimer = Timer.scheduledTimer(
+            withTimeInterval: modifierPollInterval,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkModifierState()
             }
-            return Unmanaged.passRetained(event)
+        }
+    }
+
+    /// Check if Command key is still pressed using CGEventSource
+    /// This works independently of event taps and Secure Input mode
+    private func checkModifierState() {
+        guard isActive else {
+            modifierPollTimer?.invalidate()
+            modifierPollTimer = nil
+            return
         }
 
-        let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-        let flags = event.flags
+        // Query the current modifier flags directly from the system
+        let currentFlags = CGEventSource.flagsState(.hidSystemState)
+        let isCmdPressed = currentFlags.contains(.maskCommand)
 
-        // Check for our target hotkey (Cmd + Escape)
-        let isCmdPressed = flags.contains(.maskCommand)
-        let isTargetKey = keyCode == targetKeyCode
-
-        // Also check that no other major modifiers are pressed
-        let hasOtherModifiers = flags.contains(.maskShift) ||
-                                flags.contains(.maskAlternate) ||
-                                flags.contains(.maskControl)
-
-        guard isTargetKey && isCmdPressed && !hasOtherModifiers else {
-            return Unmanaged.passRetained(event)
+        if !isCmdPressed {
+            Log.hotkey.warning("Detected Cmd release via polling (event was missed)")
+            handleKeyUp()
         }
+    }
 
-        switch type {
-        case .keyDown:
-            if !isKeyDown {
-                isKeyDown = true
-                onKeyDown()
+    /// Start a safety timeout to prevent infinite recording
+    private func startSafetyTimeout() {
+        safetyTimeoutTask?.cancel()
+
+        safetyTimeoutTask = Task { [weak self, maxRecordingDuration] in
+            try? await Task.sleep(for: .seconds(maxRecordingDuration))
+
+            guard !Task.isCancelled else { return }
+
+            await MainActor.run { [weak self] in
+                guard let self, self.isActive else { return }
+                Log.hotkey.warning("Safety timeout triggered after \(maxRecordingDuration)s")
+                self.handleKeyUp()
             }
-            // Consume the event so it doesn't propagate
-            return nil
-
-        case .keyUp:
-            if isKeyDown {
-                isKeyDown = false
-                onKeyUp()
-            }
-            // Consume the event
-            return nil
-
-        case .flagsChanged:
-            // Handle case where Cmd is released while Escape was held
-            if isKeyDown && !isCmdPressed {
-                isKeyDown = false
-                onKeyUp()
-            }
-            return Unmanaged.passRetained(event)
-
-        default:
-            return Unmanaged.passRetained(event)
         }
+    }
+
+    /// Stop all safety mechanisms
+    private func stopSafetyMechanisms() {
+        modifierPollTimer?.invalidate()
+        modifierPollTimer = nil
+        safetyTimeoutTask?.cancel()
+        safetyTimeoutTask = nil
     }
 }
