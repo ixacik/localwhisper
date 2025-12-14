@@ -1,5 +1,7 @@
 # LocalASR
 
+![example](https://github.com/user-attachments/assets/4a35d66e-a09e-4520-a638-8e7cdcb2ec8e)
+
 **On-device speech recognition for macOS** — A private, local dictation app powered by WhisperKit.
 
 No cloud services or subscriptions.
@@ -11,6 +13,8 @@ No cloud services or subscriptions.
 - **System-Wide**: Types directly into any focused text field
 - **Privacy-First**: Your audio never leaves your device
 - **Fast**: Uses distil-large-v3 for near real-time transcription
+
+<img width="517" height="527" alt="image" src="https://github.com/user-attachments/assets/aa14cf6e-a22a-40dd-811f-2ccb2e89dcb2" />
 
 ## Requirements
 
