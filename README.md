@@ -2,7 +2,7 @@
 
 **On-device speech recognition for macOS** — A private, local dictation app powered by WhisperKit.
 
-No cloud services. No subscriptions. Just hold ⌘+Escape and speak.
+No cloud services or subscriptions.
 
 ## Features
 
